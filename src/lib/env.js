@@ -9,8 +9,8 @@ const EnvSchema = z.object({
   // AI providers
   OPENAI_API_KEY: z.string().min(1),
   REPLICATE_API_TOKEN: z.string().min(1),
-  ELEVENLABS_API_KEY: z.string().min(1).optional(),
-  GOOGLE_API_KEY: z.string().min(1).optional(),
+  ELEVENLABS_API_KEY: z.string().default(""),
+  GOOGLE_API_KEY: z.string().default(""),
 
   // Optional overrides
   OPENAI_MODEL: z.string().min(1).optional()
