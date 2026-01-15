@@ -324,6 +324,104 @@ export const circuitBreaker = new CircuitBreaker();
    🎬 DIRECTOR AI (OPENAI)
 ======================= */
 
+function safeExcerpt(text, maxChars) {
+  if (!text) return "";
+  const t = String(text).trim();
+  if (!t) return "";
+  return t.length > maxChars ? `${t.slice(0, maxChars)}\n…(truncated)…` : t;
+}
+
+function buildDirectorSystemPrompt({ baseStoryPrompt }) {
+  // This is the "prompt engine": make the model plan beats, keep continuity, and write filmable output.
+  return `You are a professional film director + screenwriter.
+You write CINEMATIC, filmable scenes designed for AI video generation.
+
+CORE OBJECTIVE:
+- Make the best possible creative choices (visual blocking + actions + dialogue) while preserving continuity.
+
+TOPIC / PREMISE ANCHOR (NON-NEGOTIABLE):
+- The core premise is: "${baseStoryPrompt}"
+- Every scene must advance this premise and stay in-genre.
+- Do not introduce unrelated subplots, settings, or themes.
+
+CONTINUITY RULES (NON-NEGOTIABLE):
+1) Start exactly where the previous scene ended (positions, motion, props, wardrobe).
+2) Never reset the scene, time, or character states unless the story explicitly transitions.
+3) Keep names consistent and only introduce new characters if requested.
+
+SCENE DESIGN RULES (BETTER CHOICES):
+- Every scene must have: OBJECTIVE (what someone wants), OBSTACLE (what blocks it), TURN (a surprise), and HOOK (momentum into next scene).
+- Prefer specific, filmable actions over abstract feelings.
+- Include camera language that a cinematographer would understand (wide/medium/close, push-in, pan, dolly, handheld vs locked).
+- Use environmental details that influence the scene (sound, crowd, weather, lighting).
+
+DIALOGUE RULES (BETTER DIALOGUE):
+- Dialogue must be SHORT and MOVIE-REALISTIC (no prose).
+- Distinct voice per character: different rhythm, slang level, temperament, and tactics.
+- Use subtext: characters rarely say exactly what they mean.
+- Allow interruptions, reactions, and short interjections (e.g., "(beat)", "(overlapping)").
+- Max 3–6 lines total unless the user explicitly requests more dialogue-heavy scenes.
+
+OUTPUT FORMAT (STRICT):
+SCENE_VISUAL:
+[Filmable visual description. Include blocking + camera moves + lighting. Present tense.]
+
+DIALOGUE:
+Character: "Line"
+Character: "Line"
+
+SCENE_END_HOOK:
+[1–2 sentences describing the final continuous motion / cliffhanger that leads directly into the next scene.]
+
+SCENE_SUMMARY:
+[One paragraph continuity summary: where everyone is, what changed, what they’re doing next.]`;
+}
+
+function buildDirectorUserPrompt({
+  baseStoryPrompt,
+  styleReference,
+  previousSceneEnd,
+  storySoFar,
+  characters,
+  sceneNumber,
+  totalScenes
+}) {
+  const styleBlock = safeExcerpt(styleReference, 4500);
+  const continuityBlock = safeExcerpt(storySoFar, 5000);
+
+  return `
+STORY PREMISE / PROJECT BRIEF:
+${baseStoryPrompt}
+
+${styleBlock ? `STYLE REFERENCE (tone + cadence only, do NOT copy verbatim):\n${styleBlock}\n` : ""}
+${previousSceneEnd ? `PREVIOUS SCENE ENDED WITH (match this exactly): ${previousSceneEnd}\n` : ""}
+STORY CONTINUITY SO FAR (treat as canon):
+${continuityBlock || "Beginning of the film."}
+
+CHARACTER DETAILS (keep voices distinct; do not change wardrobe/identity):
+${characters
+  .map((c) => {
+    const lines = [];
+    lines.push(`- ${c.name}`);
+    if (c.personality) lines.push(`  - Personality/voice: ${c.personality}`);
+    if (c.base_prompt) lines.push(`  - Visual style: ${c.base_prompt}`);
+    if (c.visual_details) lines.push(`  - Visual details: ${c.visual_details}`);
+    if (c.reference_image) lines.push(`  - Reference: ${c.reference_image}`);
+    lines.push(`  - Must remain visually identical across scenes (face/body/hair/wardrobe)`);
+    return lines.join("\n");
+  })
+  .join("\n")}
+
+WRITE: SCENE ${sceneNumber} of ${totalScenes}.
+
+REQUIREMENTS:
+- Start exactly where the previous scene left off
+- Make strong, specific choices (objective/obstacle/turn/hook)
+- Add camera moves + blocking + lighting
+- End with continuous motion that leads into scene ${sceneNumber + 1}
+- Keep dialogue sparse (movie dialogue), 3–6 lines max`;
+}
+
 async function generateSceneScript({
   openai,
   openaiModel,
@@ -332,98 +430,19 @@ async function generateSceneScript({
   totalScenes,
   characters,
   baseStoryPrompt,
-  previousSceneEnd = null
+  previousSceneEnd = null,
+  styleReference = null
 }) {
-  // Build detailed character descriptions
-  const characterDescriptions = characters.map((c) => {
-    let desc = `CHARACTER: ${c.name}\n`;
-    desc += `- Personality: ${c.personality || "realistic movie character"}\n`;
-    if (c.base_prompt) {
-      desc += `- Visual Style: ${c.base_prompt}\n`;
-    }
-    if (c.visual_details) {
-      desc += `- Visual Details: ${c.visual_details}\n`;
-    }
-    if (c.reference_image) {
-      desc += `- Reference: ${c.reference_image}\n`;
-    }
-    desc += `- MUST maintain exact same appearance, clothing, and characteristics across ALL scenes\n`;
-    return desc;
-  }).join("\n");
-
-  const systemPrompt = `You are a professional film director and screenwriter with 20 years experience.
-You write realistic cinematic scenes with strong continuity for AI video generation.
-
-CRITICAL RULES - STAY ON TOPIC & CHARACTER CONSISTENCY:
-1. The CORE STORY PREMISE is: "${baseStoryPrompt}"
-2. EVERY scene MUST directly relate to and advance this exact story premise
-3. NEVER deviate from the main topic, theme, or concept mentioned in the premise
-4. CHARACTERS MUST maintain their exact personalities, appearances, and visual details throughout
-5. Each character's dialogue style must match their personality
-6. Scenes MUST flow naturally from previous scene
-7. END every scene with CONTINUOUS MOTION that leads into next scene
-8. Keep dialogue SHORT and REALISTIC (movie dialogue, not prose)
-9. NEVER reset story or character positions
-10. Maintain consistent character wardrobes, appearances, and visual characteristics
-11. Always describe VISUAL elements that can be shown on screen
-12. Focus on actions, expressions, camera movements
-13. Each scene should have a clear beginning, middle, and cliffhanger ending
-14. If the story premise mentions specific themes, settings, or concepts, ALWAYS incorporate them
-
-CHARACTER CONSISTENCY ENFORCEMENT:
-- Each character MUST look exactly the same in every scene
-- Character personalities MUST be consistent with their defined traits
-- Character dialogue MUST match their personality and role in the story
-- Visual descriptions MUST reference the character's specific appearance details
-- Do NOT change character appearances, clothing, or traits unless the story explicitly requires it
-
-TOPIC CONSISTENCY ENFORCEMENT:
-- Before writing each scene, re-read: "${baseStoryPrompt}"
-- Every visual element MUST serve this core story
-- Maintain thematic consistency throughout ALL scenes
-- Do NOT introduce unrelated elements, subplots, or themes
-- If premise mentions "sci-fi", keep it sci-fi. If "fantasy", keep it fantasy. Stay true to the genre and theme.
-- Characters must act in ways that serve the story premise
-
-FORMAT STRICTLY:
-SCENE_VISUAL:
-[Detailed visual description including camera movements, lighting, character actions. MUST include specific character appearance details.]
-
-DIALOGUE:
-Character: "Line"
-Character: "Line"
-
-SCENE_SUMMARY:
-[One paragraph summary for continuity]`;
-
-  const userPrompt = `
-CORE STORY PREMISE (STAY ON THIS TOPIC - EVERYTHING MUST RELATE TO THIS): 
-"${baseStoryPrompt}"
-
-${previousSceneEnd ? `PREVIOUS SCENE ENDED WITH: ${previousSceneEnd}\n` : ""}
-STORY CONTINUITY SO FAR:
-${storySoFar || "Beginning of the film."}
-
-CHARACTER DETAILS (MAINTAIN EXACT CONSISTENCY):
-${characterDescriptions}
-
-Write SCENE ${sceneNumber} of ${totalScenes}.
-
-CRITICAL REQUIREMENTS:
-- STAY ON TOPIC: This scene must directly relate to and advance: "${baseStoryPrompt}"
-- CHARACTER CONSISTENCY: Each character must look, act, and speak exactly as defined above
-- Start exactly where previous scene left off
-- Describe camera movements: pan, dolly, push in, crane shot, etc.
-- Include lighting and atmosphere that matches the story premise
-- Characters should be in motion when possible
-- End with a moment that naturally leads into scene ${sceneNumber + 1}
-- Dialogue should be sparse and impactful (max 3-4 lines total)
-- Dialogue MUST match each character's personality
-- Use present tense for visual descriptions
-- Every visual element must serve the core story premise
-- Do NOT introduce unrelated themes, settings, or concepts
-- When describing characters, reference their specific visual details and appearance
-- Ensure character actions align with their personalities and the story premise`;
+  const systemPrompt = buildDirectorSystemPrompt({ baseStoryPrompt });
+  const userPrompt = buildDirectorUserPrompt({
+    baseStoryPrompt,
+    styleReference,
+    previousSceneEnd,
+    storySoFar,
+    characters,
+    sceneNumber,
+    totalScenes
+  });
 
   try {
     console.log(`\n🎬 [SCENE ${sceneNumber}/${totalScenes}] Starting script generation...`);
@@ -475,6 +494,9 @@ Professional camera movements, smooth transitions.
 DIALOGUE:
 ${characters[0]?.name || "Character"}: "We need to keep moving."
 
+SCENE_END_HOOK:
+They keep moving forward, still in motion as the moment cuts.
+
 SCENE_SUMMARY:
 The characters continue their journey, maintaining momentum for the next scene.`;
   }
@@ -482,14 +504,18 @@ The characters continue their journey, maintaining momentum for the next scene.`
 
 function extractSceneParts(sceneScript) {
   const visualMatch = sceneScript.match(
-    /SCENE_VISUAL:\n([\s\S]*?)(?:\n\nDIALOGUE:|\n\nSCENE_SUMMARY:|$)/
+    /SCENE_VISUAL:\n([\s\S]*?)(?:\n\nDIALOGUE:|\n\nSCENE_END_HOOK:|\n\nSCENE_SUMMARY:|$)/
   );
-  const dialogueMatch = sceneScript.match(/DIALOGUE:\n([\s\S]*?)(?:\n\nSCENE_SUMMARY:|$)/);
+  const dialogueMatch = sceneScript.match(
+    /DIALOGUE:\n([\s\S]*?)(?:\n\nSCENE_END_HOOK:|\n\nSCENE_SUMMARY:|$)/
+  );
+  const endHookMatch = sceneScript.match(/SCENE_END_HOOK:\n([\s\S]*?)(?:\n\nSCENE_SUMMARY:|$)/);
   const summaryMatch = sceneScript.match(/SCENE_SUMMARY:\n([\s\S]*)$/);
 
   return {
     visual: visualMatch ? visualMatch[1].trim() : sceneScript.substring(0, 500),
     dialogue: dialogueMatch ? dialogueMatch[1].trim() : "",
+    endHook: endHookMatch ? endHookMatch[1].trim() : "",
     summary: summaryMatch ? summaryMatch[1].trim() : "Scene continues the story.",
     fullScript: sceneScript
   };
@@ -931,6 +957,7 @@ export async function createMovie({
   enableParallel = true,
   modelChain = null,
   projectName = null,
+  styleReference = null,
   abortSignal = null,
   jobId = null
 }) {
@@ -1056,7 +1083,8 @@ export async function createMovie({
           totalScenes,
           characters,
           baseStoryPrompt,
-          previousSceneEnd
+          previousSceneEnd,
+          styleReference
         });
 
         const sceneParts = extractSceneParts(sceneScript);
@@ -1085,7 +1113,7 @@ export async function createMovie({
         console.log(`✅ [SCENE ${i}] Video saved! URL: ${savedUrl}`);
 
         storySoFar += `\nScene ${i}: ${sceneParts.summary}`;
-        previousSceneEnd = sceneParts.summary;
+        previousSceneEnd = sceneParts.endHook || sceneParts.summary;
 
         sceneData = {
           ...sceneData,
